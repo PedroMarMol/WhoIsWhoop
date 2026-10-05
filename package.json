@@ -1,0 +1,23 @@
+{
+  "name": "whoiswhoop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Talk to a WHOOP 4.0 over Bluetooth Low Energy from Fedora, without the official API.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/main.ts",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "node-ble": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
