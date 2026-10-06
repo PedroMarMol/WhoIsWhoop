@@ -19,6 +19,16 @@ export const WHOOP_COMMAND = {
   GET_CLOCK: 11,
   /** Ask for the battery level (returns a COMMAND_RESPONSE). */
   GET_BATTERY_LEVEL: 26,
+  /**
+   * Start the historical-data offload on the data channel (61080005).
+   * Payload [0x00]. Verified against the real strap (55-chunk offload).
+   */
+  SEND_HISTORICAL_DATA: 22,
+  /**
+   * Acknowledge a chunk-end METADATA frame, advancing the offload.
+   * Payload [0x01, ...frame[17:25]] from the type-49 [6]===0x02 frame.
+   */
+  HISTORICAL_DATA_RESULT: 23,
 } as const;
 
 /** Names for the command numbers we know, used to label responses. */
@@ -26,6 +36,8 @@ export const COMMAND_NAMES: Record<number, string> = {
   [WHOOP_COMMAND.TOGGLE_REALTIME_HR]: "TOGGLE_REALTIME_HR",
   [WHOOP_COMMAND.GET_CLOCK]: "GET_CLOCK",
   [WHOOP_COMMAND.GET_BATTERY_LEVEL]: "GET_BATTERY_LEVEL",
+  [WHOOP_COMMAND.SEND_HISTORICAL_DATA]: "SEND_HISTORICAL_DATA",
+  [WHOOP_COMMAND.HISTORICAL_DATA_RESULT]: "HISTORICAL_DATA_RESULT",
 };
 
 export function commandName(cmd: number): string {

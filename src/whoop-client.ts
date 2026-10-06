@@ -6,7 +6,7 @@
  * notification listeners, and it routes parsed frames to the right decoder.
  *
  * Layering:
- *   whoop-client.ts (transport/session)  →  framing.ts + decoders.ts (pure)
+ *   whoop-client.ts (transport/session)  →  framing.ts + decoders.ts + historical.ts (pure)
  *   framing.ts (CRC, frame build/parse)  →  nothing
  *   decoders.ts (frame → domain objects) →  framing.ts + commands.ts
  */
@@ -21,6 +21,7 @@ import {
   type WhoopEvent,
 } from "./decoders.js";
 import { buildCommandFrame, parseFrame, Reassembler, PACKET_TYPE } from "./framing.js";
+import { decodeHistoricalDataV24, type HistoricalDataResult } from "./historical.js";
 import {
   WHOOP4_CMD_NOTIFY_UUID,
   WHOOP4_CMD_WRITE_UUID,
@@ -39,6 +40,26 @@ function findUuid(uuids: string[], expected: string): string | undefined {
 }
 
 export type { CommandResponse, RealtimeHeartRateSample, WhoopEvent };
+export type { HistoricalDataV24 } from "./historical.js";
+
+/**
+ * A HISTORICAL_DATA (type 47) frame received on the data channel.
+ *
+ * `result` is the explicit decoder outcome: `ok` for a decoded V24 record,
+ * otherwise the decoder error (`unsupported-version` for V25 — V25 is never
+ * decoded). `raw` is the untouched frame, preserved so callers can inspect or
+ * store records the decoder does not support.
+ */
+export type HistoricalDataFrame = {
+  result: HistoricalDataResult;
+  raw: Buffer;
+};
+
+/** Result of one completed historical offload. */
+export type HistoricalDownloadResult = {
+  /** Number of V24 records delivered via `onHistoricalData()` during the offload. */
+  historicalRecords: number;
+};
 
 /**
  * An open session with the WHOOP custom service. Create it with
@@ -51,6 +72,16 @@ export class WhoopSession {
   private readonly commandResponseCallbacks: Array<(r: CommandResponse) => void> = [];
   private readonly eventCallbacks: Array<(e: WhoopEvent) => void> = [];
   private readonly realtimeCallbacks: Array<(s: RealtimeHeartRateSample) => void> = [];
+  private readonly historicalCallbacks: Array<(f: HistoricalDataFrame) => void> = [];
+
+  // The single in-flight historical offload, if any (see downloadHistoricalData).
+  private download:
+    | {
+        resolve: (result: HistoricalDownloadResult) => void;
+        reject: (error: Error) => void;
+        records: number;
+      }
+    | undefined;
 
   // One reassembler per notify channel: notifications arrive MTU-fragmented
   // (especially the data channel), so each stream buffers until whole frames.
@@ -131,15 +162,60 @@ export class WhoopSession {
   private readonly onDataNotify = (buffer: Buffer): void => {
     for (const frame of this.dataReassembler.feed(buffer)) {
       const parsed = parseFrame(frame);
-      if (!parsed.ok || parsed.type !== PACKET_TYPE.REALTIME_DATA) {
+      if (!parsed.ok) {
         continue;
       }
-      const sample = decodeRealtimeData(parsed.raw);
-      if (sample !== undefined) {
-        for (const cb of this.realtimeCallbacks) {
-          cb(sample);
+      if (parsed.type === PACKET_TYPE.REALTIME_DATA) {
+        const sample = decodeRealtimeData(parsed.raw);
+        if (sample !== undefined) {
+          for (const cb of this.realtimeCallbacks) {
+            cb(sample);
+          }
         }
+        continue;
       }
+      if (parsed.type === PACKET_TYPE.HISTORICAL_DATA) {
+        const historical: HistoricalDataFrame = {
+          result: decodeHistoricalDataV24(parsed.raw),
+          raw: parsed.raw,
+        };
+        if (this.download !== undefined && historical.result.ok) {
+          this.download.records += 1;
+        }
+        for (const cb of this.historicalCallbacks) {
+          cb(historical);
+        }
+        continue;
+      }
+      if (parsed.type === PACKET_TYPE.METADATA) {
+        this.onMetadataFrame(parsed.raw);
+      }
+    }
+  };
+
+  /**
+   * Handle a METADATA (type 49) frame during an offload. Only the verified
+   * `frame[6]` markers are used: `0x02` = chunk end (ack it), `0x03` = final
+   * completion. `0x01` (chunk start) and any other value are observed and
+   * ignored — no other metadata field is interpreted.
+   */
+  private readonly onMetadataFrame = (frame: Buffer): void => {
+    const download = this.download;
+    if (download === undefined) {
+      return; // metadata outside an offload is not ours to act on
+    }
+    if (frame[6] === 0x02) {
+      // Verified ACK: HISTORICAL_DATA_RESULT(23) with [0x01, ...frame[17:25]].
+      const payload = [0x01, ...frame.subarray(17, 25)];
+      void this.sendCommand(WHOOP_COMMAND.HISTORICAL_DATA_RESULT, payload).catch((error: unknown) => {
+        if (this.download === download) {
+          this.download = undefined;
+        }
+        download.reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    } else if (frame[6] === 0x03) {
+      this.download = undefined;
+      download.resolve({ historicalRecords: download.records });
     }
   };
 
@@ -173,6 +249,35 @@ export class WhoopSession {
     return this.sendCommand(WHOOP_COMMAND.GET_CLOCK, []);
   }
 
+  /**
+   * Run one historical-data offload: send SEND_HISTORICAL_DATA (22, [0x00]),
+   * ack every chunk-end METADATA frame (type 49, frame[6]===0x02) with
+   * HISTORICAL_DATA_RESULT (23, [0x01, ...frame[17:25]]), and resolve when the
+   * final METADATA frame (frame[6]===0x03) arrives.
+   *
+   * Individual V24 records are delivered through `onHistoricalData()` while
+   * this runs. Only one offload may be in flight at a time.
+   */
+  async downloadHistoricalData(): Promise<HistoricalDownloadResult> {
+    if (this.download !== undefined) {
+      throw new Error("a historical download is already in progress");
+    }
+    let resolve!: (result: HistoricalDownloadResult) => void;
+    let reject!: (error: Error) => void;
+    const completion = new Promise<HistoricalDownloadResult>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.download = { resolve, reject, records: 0 };
+    try {
+      await this.sendCommand(WHOOP_COMMAND.SEND_HISTORICAL_DATA, [0x00]);
+    } catch (error) {
+      this.download = undefined;
+      throw error;
+    }
+    return completion;
+  }
+
   /** Register a callback for COMMAND_RESPONSE frames. */
   onCommandResponse(cb: (r: CommandResponse) => void): void {
     this.commandResponseCallbacks.push(cb);
@@ -188,8 +293,23 @@ export class WhoopSession {
     this.realtimeCallbacks.push(cb);
   }
 
+  /**
+   * Register a callback for HISTORICAL_DATA (type 47) frames. The callback
+   * fires for every type-47 frame; it carries the decode result (a V24 record
+   * or an explicit error such as `unsupported-version`) and the raw frame.
+   */
+  onHistoricalData(cb: (f: HistoricalDataFrame) => void): void {
+    this.historicalCallbacks.push(cb);
+  }
+
   /** Stop notifications and detach listeners. The BLE link is left up. */
   async close(): Promise<void> {
+    // Do not leave a pending offload promise dangling if the session is closed.
+    if (this.download !== undefined) {
+      const pending = this.download;
+      this.download = undefined;
+      pending.reject(new Error("WhoopSession closed during historical download"));
+    }
     this.cmdNotify.removeListener("valuechanged", this.onCmdNotify);
     this.eventNotify.removeListener("valuechanged", this.onEventNotify);
     this.dataNotify.removeListener("valuechanged", this.onDataNotify);

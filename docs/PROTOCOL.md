@@ -233,6 +233,131 @@ Conclusion **[hypothesis]**:
 
 ## 11. What we deliberately have NOT implemented
 
-Historical data (`HISTORICAL_DATA` type 47, the 14-day store), the raw stream
-(type 43), the connect handshake (`GET_HELLO_HARVARD`/`SET_CLOCK`/`GET_DATA_RANGE`),
-and any other commands. `[NOOP]` documents them; we have not exercised them.
+The raw stream (type 43), the connect handshake
+(`GET_HELLO_HARVARD`/`SET_CLOCK`/`GET_DATA_RANGE`), and any other commands.
+`[NOOP]` documents them; we have not exercised them.
+
+A conservative **offline** decoder for type-47 V24 records (`src/historical.ts`,
+§12) and a minimal **historical offload state machine**
+(`WhoopSession.downloadHistoricalData()`, §13) now exist.
+
+## 12. HISTORICAL_DATA (type 47) — conservative V24 decoder
+
+Implemented in `src/historical.ts` (`decodeHistoricalDataV24`). Pure and offline:
+it decodes records that were already captured and does **not** talk to the strap.
+
+Confidence tags below: **[verified]**, **[strongly supported]**, **[unknown]**.
+
+Evidence base: `captures/type47_raw_hex.txt` — **2877 V24 records** (exactly 104
+bytes) and **120 V25 records** (84 bytes), all passing zlib CRC-32. Fields are
+frame-absolute offsets.
+
+### 12.1 V24 layout (104-byte record)
+
+| offset | len | field | confidence | evidence |
+|---|---|---|---|---|
+| 0 | 1 | SOF `0xAA` | **[verified]** | every frame |
+| 1–2 | 2 | frame length (`= 100`) | **[verified]** | u16 LE; total = len + 4 |
+| 3 | 1 | CRC-8 over the two length bytes | **[verified]** | all 2877 |
+| 4 | 1 | packet type `47` | **[verified]** | all 2877 |
+| 5 | 1 | version `24` | **[verified]** | all 2877 |
+| 6 | 1 | marker `0x05` | **[verified]** | constant |
+| 7–10 | 4 | sequence | **[verified]** | u32 LE; strictly +1, no gaps |
+| 11–14 | 4 | Unix seconds | **[verified]** | u32 LE; +1/s (111 duplicate seconds) |
+| 15–16 | 2 | sub-second timing | **[strongly supported]** | u16 LE; splits same-second pairs; encoding not established |
+| 17–20 | 4 | unknown header | **[unknown]** | exposed raw as `header17_20` |
+| 21 | 1 | heart rate (bpm) | **[verified]** | 58–124 in capture |
+| 22 | 1 | rr_count | **[verified]** | 0–4 in capture |
+| 23–30 | 8 | RR intervals (ms) | **[verified]** | up to 4 × u16 LE; first `rr_count` valid; ≈ `60000/HR` |
+| 31–39 | 9 | unknown | **[unknown]** | exposed raw as `bytes31_39` |
+| 40–51 | 12 | gravity/accelerometer vector | **[strongly supported]** | 3 × f32 LE; \|g\| median 1.011, range 0.52–1.22 |
+| 52–55 | 4 | unknown | **[unknown]** | exposed raw as `bytes52_55` |
+| 55 | — | *see 52–55* | **[unknown]** | NOOP calls this `skin_contact`; **not accepted** (see 12.2) |
+| 56–67 | 12 | duplicate of the gravity/accelerometer vector | **[verified]** | byte-identical to 40–51 in all 2877 records |
+| 68–79 | 12 | six unknown u16 | **[unknown]** | exposed raw as `uint16_68_79` (NOOP labels them SpO2/temp/ambient/LED — unproven) |
+| 80–83 | 4 | unknown | **[unknown]** | exposed raw as `bytes80_83`; constant `0x0C01` / `0x0C02` |
+| 84–99 | 16 | unknown tail | **[unknown]** | exposed raw as `tail84_99` |
+| 100–103 | 4 | CRC-32 (zlib) over `frame[4..100]` | **[verified]** | all 2877 |
+
+The decoder intentionally does **not** name or convert offsets 31–39, 52–55,
+68–79, 80–83, or the tail. Those ranges are preserved verbatim in `raw`.
+
+### 12.2 NOOP interpretations explicitly NOT accepted
+
+Our full capture contradicts these NOOP `whoop_protocol.json` V24 labels, so we
+do **not** adopt them (they remain `[unknown]` here):
+
+- **offset 55 `skin_contact`** — NOOP documents it as `0 = off-wrist`. In our
+  corpus it takes 15 distinct values (`0`, `63–70`, `194–199`, i.e. signed
+  `-62…-57 / 0 / +63…+70`) and toggles ~2030 times across 2877 records, with no
+  correlation to HR (`r = -0.066`) or `\|g\|` (`r = 0.026`). It is not a
+  `0`/non-zero contact flag.
+- **offset 80 `resp_rate_raw`** — constant `0x0C01` in every record; a per-sample
+  respiratory rate cannot be constant.
+- **offset 82 `signal_quality`** — constant `0x0C02` in every record.
+
+NOOP's `unix`@11, `heart_rate`@21, `rr_count`@22, RR@23, `gravity_*`@40/44/48 and
+`gravity2_*`@56/60/64 labels **are** confirmed by our data.
+
+### 12.3 Version 25 — observed but intentionally unsupported
+
+The capture also contains **120 records of type 47, version 25, exactly 84
+bytes** (header length field `80`, marker `0x00`). They overlap the V24 stream in
+time. V25 is **not** a truncated V24: the float32 gravity block is absent, offset
+21 is a small value (`1–4`, not HR), and its CRC-32 lives at offsets 80–83 (which
+is why bytes 80/82 "vary" there). Its payload layout is not understood.
+
+`decodeHistoricalDataV24` therefore returns an explicit `unsupported-version`
+error for V25. No V25 decoder is provided.
+
+## 13. Historical offload lifecycle
+
+Implemented in `WhoopSession.downloadHistoricalData()` (`src/whoop-client.ts`).
+
+Evidence base: `captures/historical_offload_ack_raw_hex.txt` — one complete,
+ack-driven offload (2929 frames) captured from our own WHOOP 4.0.
+
+### 13.1 Verified by real WHOOP 4.0 capture
+
+- **`SEND_HISTORICAL_DATA` = command `22`, payload `[0x00]`** — starts the
+  historical stream on the data channel `61080005`.
+- **`HISTORICAL_DATA_RESULT` = command `23`, payload `[0x01, ...frame[17:25]]`**
+  — sent once per chunk end.
+- **METADATA frames are packet type `49`.** Three `frame[6]` markers were
+  observed:
+
+  | `frame[6]` | total length | role observed |
+  |---|---|---|
+  | `0x01` | 48 | chunk start; precedes the type-47 records of a chunk |
+  | `0x02` | 32 | chunk end; `frame[17:25]` is an 8-byte field wholly inside the payload (CRC-32 begins at offset 28) |
+  | `0x03` | 20 | final completion; observed exactly once at the end |
+
+- Acking each `[6]===0x02` frame with command 23 `[0x01, ...frame[17:25]]`
+  **advances the strap to the next chunk** (a new `[6]===0x01`, then type-47
+  records, then a new `[6]===0x02`).
+- The capture completed **55 chunks**; **all 55 ACKs were accepted**, after which
+  the strap sent the single `[6]===0x03` frame and stopped.
+
+### 13.2 State machine
+
+`downloadHistoricalData()`:
+
+1. reject if another offload is already in flight;
+2. send command `22` with `[0x00]`;
+3. for every type-49 frame with `frame[6]===0x02`, send command `23` with
+   `[0x01, ...frame[17:25]]`;
+4. resolve when a type-49 frame with `frame[6]===0x03` arrives.
+
+Type-47 records are delivered through the existing `onHistoricalData()` callback
+while the offload runs. `[6]===0x01` is observed and ignored. No retry,
+reconnect, cancellation or persistence is implemented.
+
+### 13.3 Explicitly still unknown / not interpreted
+
+- The meaning of every METADATA field other than the `frame[6]` markers — in
+  particular **`frame[17:25]`**: its role as the ACK bytes is verified, its
+  semantics are **unknown**.
+- The meaning of the `[6]===0x01` payload.
+- V25 (type-47 version 25) semantics — still unsupported.
+
+No semantic names are assigned to any of these fields.
